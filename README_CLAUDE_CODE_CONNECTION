@@ -1,0 +1,144 @@
+# Connecting Local ExLlamaV3 / Local LLMs to Claude Code via LiteLLM
+
+This guide provides step-by-step instructions for running a dual-profile **Claude Code CLI** setup in Git Bash on Windows:
+1. **`claude`**: Standard Claude Code CLI connected to your official Claude Pro subscription via browser OAuth.
+2. **`claude-local`**: Custom alias that routes requests strictly to a local LLM running on **ExLlamaV3** via **LiteLLM**.
+
+---
+
+## Prerequisites
+
+- **ExLlamaV3 API Server** running locally on port 8888 (`python tools/serve_openai.py --port 8888`).
+- **Python 3.10+** environment with `litellm` installed (`pip install litellm`).
+- **Node.js / npm** installed on Windows.
+- **Claude Code CLI** installed globally:
+  ```bash
+  npm install -g @anthropic-ai/claude-code
+  ```
+
+---
+
+## Step 1: Patch ExLlama Server for Mid-Turn System Messages
+
+Qwen and other HuggingFace Jinja chat templates raise an error if `system` messages appear after conversation index 0 (`jinja2.exceptions.TemplateError: System message must be at the beginning.`). Because Claude Code injects system context nudges mid-conversation, you must sanitize incoming messages before template processing.
+
+### Option A: Edit `tools/serve_openai.py` (Recommended)
+1. Open `tools/serve_openai.py` in your ExLlama directory.
+2. Locate `def generate_full` (around line 290–295).
+3. Insert this message-sanitizing block immediately **above** `input_ids = tokenizer.hf_chat_template(...)`:
+
+```python
+# Sanitize mid-conversation system messages for Jinja chat templates
+messages = [
+    {**msg, "role": "user", "content": f"[System]: {msg.get('content', '')}"}
+    if msg.get("role") == "system" and idx > 0
+    else msg
+    for idx, msg in enumerate(messages)
+]
+```
+
+### Option B: Edit `tokenizer_config.json`
+1. Open `tokenizer_config.json` inside your model directory.
+2. Search for `raise_exception` and remove this template guardrail:
+```text
+{%- if not loop.first %}\n            {{- raise_exception('System message must be at the beginning.') }}\n        {%- endif %}\n   
+```
+
+> **CRITICAL:** You must completely restart the ExLlama server process (`serve_openai.py`) using `Ctrl + C` after applying either fix for changes to take effect.
+
+---
+
+## Step 2: Configure LiteLLM (`litellm_config.yaml`)
+
+Create a `litellm_config.yaml` file in your workspace:
+
+```yaml
+litellm_settings:
+  drop_params: true  # Filters out unsupported parameters (e.g., thinking, tool schemas)
+
+model_list:
+  - model_name: "*"  # Catches all models requested by Claude Code (e.g., claude-sonnet-5)
+    litellm_params:
+      model: custom_openai/Qwen3.8-27B-EXL3-3.5bpw  # 'custom_openai/' forces standard /v1/chat/completions
+      api_base: http://localhost:8888/v1
+      api_key: sk-local
+      drop_params: true
+```
+
+---
+
+## Step 3: Bypass First-Run Onboarding OAuth Loop
+
+By default, Claude Code tries to launch a browser to perform web OAuth authentication when running locally. Flag the onboarding as complete in your local configuration so it uses your local environment variables directly:
+
+Run this once in Git Bash:
+```bash
+echo '{"hasCompletedOnboarding": true}' > ~/.claude.json
+```
+
+*(Note: This does NOT interfere with your standard Claude Pro web login credentials, which are stored securely in Windows Credential Manager).*
+
+---
+
+## Step 4: Configure Dual Shell Alias (`claude` vs `claude-local`)
+
+To ensure your default `claude` command continues using your Claude Pro subscription while `claude-local` connects to your local model, set up a scoped shell function in Git Bash.
+
+1. Open `~/.bashrc`:
+   ```bash
+   code ~/.bashrc
+   ```
+
+2. Append the npm global path and the `claude-local` function:
+   ```bash
+   # Ensure npm global executables are in PATH
+   export PATH="$PATH:$APPDATA/npm"
+
+   # Local ExLlama execution function
+   claude-local() {
+       ANTHROPIC_BASE_URL="http://localhost:4000" \
+       ANTHROPIC_API_KEY="sk-local" \
+       claude "$@"
+   }
+   ```
+
+3. Ensure Git Bash loads `~/.bashrc` on startup by verifying line 3 in `~/.bash_profile`:
+   ```bash
+   test -f ~/.bashrc && . ~/.bashrc
+   ```
+
+4. Reload your active terminal session:
+   ```bash
+   source ~/.bashrc
+   ```
+
+---
+
+## Step 5: Execution Workflow
+
+To run your local assistant, start the backend services in order:
+
+1. **Terminal 1 (ExLlama Backend):**
+   ```bash
+   python tools/serve_openai.py --port 8888
+   ```
+2. **Terminal 2 (LiteLLM Proxy):**
+   ```bash
+   litellm --config litellm_config.yaml --port 4000
+   ```
+3. **Terminal 3 (Git Bash Client):**
+   * Run **`claude`** for your cloud Claude Pro subscription.
+   * Run **`claude-local`** (or `claude-local "your prompt"`) for your local ExLlama model.
+
+---
+
+## Troubleshooting Reference
+
+| Error / Symptom | Cause | Solution |
+| :--- | :--- | :--- |
+| **`bash: claude: command not found`** | Git Bash PATH is missing the global npm directory. | Add `export PATH="$PATH:$APPDATA/npm"` to `~/.bashrc` and restart VSCode. |
+| **`System message must be at the beginning`** | Mid-chat system messages triggered Jinja template guardrails. | Apply Step 1 patch and **restart the ExLlama server process**. |
+| **`404 /v1/responses`** | LiteLLM attempted to hit modern OpenAI endpoints unsupported by local engines. | Ensure `model` uses the `custom_openai/` prefix in `litellm_config.yaml`. |
+| **`500 Internal Server Error`** | ExLlama received unsupported JSON body parameters. | Enable `drop_params: true` in `litellm_config.yaml`. |
+| **Prompted for browser sign-in on startup** | First-run onboarding wizard defaulting to web OAuth. | Run `echo '{"hasCompletedOnboarding": true}' > ~/.claude.json`. |
+| **`HEAD /api/hello 404`** | Connection-warming latency probe sent by Claude Code at startup. | **Safe to ignore.** LiteLLM does not implement this endpoint, but core functionality is unaffected. |
